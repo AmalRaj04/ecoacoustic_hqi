@@ -37,7 +37,7 @@ HQI_WEIGHTS = {
 HQI_BUFFER_RADIUS_M = 1000   # 1 km around each recording location
 
 # ── ML model ─────────────────────────────────────────────────────────
-SPATIAL_BLOCK_SIZE_KM = 50   # spatial cross-validation block size
+SPATIAL_BLOCK_SIZE_KM = 150   # spatial cross-validation block size
 XGBOOST_PARAMS = {
     "n_estimators": 500, "max_depth": 5,
     "learning_rate": 0.05, "subsample": 0.8,
