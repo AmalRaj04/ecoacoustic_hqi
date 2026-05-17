@@ -52,27 +52,19 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Road library — prefer OSMnx, fall back to overpy ─────────────────────────
-ROAD_BACKEND = None
-
 try:
+    # pyrefly: ignore [missing-import]
     import osmnx as ox
-    ROAD_BACKEND = "osmnx"
-    log.info("Road backend: OSMnx")
+    ox.settings.use_cache = True
+    ox.settings.log_console = False
+    OSMNX_AVAILABLE = True
 except ImportError:
-    try:
-        import overpy as _overpy_mod
-        if not hasattr(_overpy_mod, "API"):
-            raise ImportError("overpy has no 'API' attribute — reinstall it.")
-        overpy = _overpy_mod
-        ROAD_BACKEND = "overpy"
-        log.info("Road backend: overpy")
-    except ImportError as _e:
-        warnings.warn(
-            f"No road backend ({_e}). road_impact will be 0.\n"
-            "Install:  pip install osmnx   OR   pip install overpy",
-            stacklevel=2,
-        )
+    OSMNX_AVAILABLE = False
+    warnings.warn(
+        "osmnx not installed — road_impact will be NaN for all recordings. "
+        "Install with: pip install osmnx",
+        stacklevel=2,
+    )
 
 load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 GEE_PROJECT = os.getenv("GEE_PROJECT", "")
@@ -358,71 +350,48 @@ def extract_all_gee(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STEP 1e — Road impact
+# ═══════════════════════════════════════════════════════════════════════════════
+# STEP 1e — Road impact (OSMnx)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def haversine_m(lat1, lon1, lat2, lon2) -> float:
-    R    = 6_371_000.0
-    phi1 = math.radians(lat1);  phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1);  dlam = math.radians(lon2 - lon1)
-    a    = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlam/2)**2
-    return 2 * R * math.asin(math.sqrt(min(a, 1.0)))
-
-
 def _road_osmnx(lat, lon, radius_m) -> float:
+    """Download road network via OSMnx and return total length in meters."""
     try:
         import osmnx as ox
-        G = ox.graph_from_point((lat, lon), dist=radius_m, network_type="all")
-        return float(ox.graph_to_gdfs(G, nodes=False)["length"].sum())
-    except Exception as exc:
-        log.warning("OSMnx (%.4f,%.4f): %s", lat, lon, exc)
+        # Download the road network within the buffer
+        G = ox.graph_from_point((lat, lon), dist=radius_m, network_type="drive")
+        
+        if len(G.edges) == 0:
+            return 0.0
+            
+        # Extract edge GeoDataFrame
+        edges = ox.graph_to_gdfs(G, nodes=False)
+        
+        # 'length' column contains the edge length in meters
+        if "length" in edges.columns:
+            return float(edges["length"].sum())
+    except ValueError as exc:
+        if "Found no graph nodes" in str(exc) or "Found no data" in str(exc) or "no data elements" in str(exc):
+            # No roads found in this area
+            return 0.0
+        log.warning("OSMnx (%.4f,%.4f) failed (ValueError): %s", lat, lon, exc)
         return np.nan
-
-
-def _road_overpy(lat, lon, radius_m, api) -> float:
-    d   = radius_m / 111_000.0
-    bbox = (lat-d, lon-d, lat+d, lon+d)
-    q   = (f"[out:json][timeout:30];"
-           f"(way[\"highway\"]({bbox[0]:.6f},{bbox[1]:.6f},{bbox[2]:.6f},{bbox[3]:.6f}););"
-           f"out geom;")
-    try:
-        result = api.query(q)
-        total  = 0.0
-        for way in result.ways:
-            ns = way.nodes
-            for i in range(len(ns)-1):
-                total += haversine_m(ns[i].lat, ns[i].lon, ns[i+1].lat, ns[i+1].lon)
-        return total
     except Exception as exc:
-        log.warning("Overpass (%.4f,%.4f): %s", lat, lon, exc)
+        log.warning("OSMnx (%.4f,%.4f) failed: %s", lat, lon, exc)
         return np.nan
-
 
 def extract_road_impact(df: pd.DataFrame) -> np.ndarray:
-    if ROAD_BACKEND is None:
-        log.warning("No road backend — road_impact_raw = 0.")
-        return np.zeros(len(df), dtype=float)
-
-    overpy_api = None
-    if ROAD_BACKEND == "overpy":
-        try:
-            import overpy as _op
-            overpy_api = _op.API(
-                url="https://overpass-api.de/api/interpreter",
-                max_retry_count=3, retry_timeout=10,
-            )
-        except Exception as exc:
-            log.error("overpy.API() failed: %s — road_impact = 0.", exc)
-            return np.zeros(len(df), dtype=float)
+    """
+    Compute road_impact_raw for each recording using OSMnx.
+    """
+    if not OSMNX_AVAILABLE:
+        log.warning("OSMnx unavailable — road_impact_raw = NaN.")
+        return np.full(len(df), np.nan)
 
     values = np.full(len(df), np.nan)
-    for i, row in enumerate(tqdm(df.itertuples(), total=len(df),
-                                  desc=f"Road ({ROAD_BACKEND})", unit="rec")):
-        if ROAD_BACKEND == "osmnx":
-            values[i] = _road_osmnx(row.lat, row.lon, HQI_BUFFER_RADIUS_M)
-        else:
-            values[i] = _road_overpy(row.lat, row.lon, HQI_BUFFER_RADIUS_M, overpy_api)
-            time.sleep(OVERPASS_DELAY_S)
+    for i, row in enumerate(tqdm(df.itertuples(), total=len(df), desc="Road impact (OSMnx)", unit="rec")):
+        values[i] = _road_osmnx(row.lat, row.lon, HQI_BUFFER_RADIUS_M)
+            
     return values
 
 
