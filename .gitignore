@@ -2,6 +2,7 @@ venv/
 __pycache__/
 *.pyc
 data/raw/audio/
+data/clean/
 outputs/
 .env
 cache

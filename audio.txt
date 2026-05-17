@@ -1,0 +1,208 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+import requests
+import librosa
+import soundfile as sf
+import pyloudnorm as pyln
+from scipy.signal import butter, filtfilt
+from tqdm import tqdm
+import warnings
+
+# Add project root to sys.path so config can be imported from anywhere
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from config import (
+    TARGET_SR, MIN_SNR_DB, BANDPASS_LOW_HZ, BANDPASS_HIGH_HZ,
+    DATA_RAW, DATA_CLEAN, DATA_HQI
+)
+
+warnings.filterwarnings('ignore', category=UserWarning)
+
+def download_audio(url, path):
+    """Download audio file if it doesn't already exist."""
+    if os.path.exists(path):
+        return True
+    
+    # Handle schema-less URLs (often returned by XC API)
+    if url.startswith('//'):
+        url = 'https:' + url
+        
+    try:
+        r = requests.get(url, stream=True, timeout=30)
+        if r.status_code == 200:
+            with open(path, 'wb') as f:
+                for chunk in r.iter_content(1024):
+                    f.write(chunk)
+            return True
+        return False
+    except Exception:
+        # If the file ended up being partially downloaded, remove it
+        if os.path.exists(path):
+            os.remove(path)
+        return False
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
+    """Apply a Butterworth bandpass filter using filtfilt for zero phase shift."""
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    y = filtfilt(b, a, data)
+    return y
+
+def estimate_snr(y, fs):
+    """Estimate SNR using RMS energy of signal vs noise proxy bands."""
+    # Signal band: 2000 - 9000 Hz
+    y_sig = butter_bandpass_filter(y, 2000, 9000, fs, order=4)
+    rms_sig = np.sqrt(np.mean(y_sig**2))
+    
+    # Noise proxy: 200 - 800 Hz
+    y_noise = butter_bandpass_filter(y, 200, 800, fs, order=4)
+    rms_noise = np.sqrt(np.mean(y_noise**2))
+    
+    # Prevent divide by zero
+    if rms_noise < 1e-10:
+        if rms_sig > 1e-10:
+            return 100.0  # Perfect SNR
+        else:
+            return 0.0    # Absolute silence
+            
+    snr = 20 * np.log10(rms_sig / rms_noise)
+    return snr
+
+def detect_clipping(y, threshold=0.98, max_fraction=0.001):
+    """Detect if audio is overly clipped."""
+    fraction_clipped = np.mean(np.abs(y) > threshold)
+    return fraction_clipped > max_fraction
+
+def main():
+    xc_meta_path = os.path.join(PROJECT_ROOT, DATA_RAW, "xc_metadata.csv")
+    hqi_path = os.path.join(PROJECT_ROOT, DATA_HQI, "hqi_scores.csv")
+    
+    if not os.path.exists(xc_meta_path) or not os.path.exists(hqi_path):
+        print(f"Missing required CSV files. Please check {xc_meta_path} and {hqi_path}.")
+        return
+
+    print("Loading metadata and HQI scores...")
+    df_meta = pd.read_csv(xc_meta_path)
+    df_hqi = pd.read_csv(hqi_path)
+    
+    # Standardise IDs for merging
+    df_meta['id'] = df_meta['id'].astype(str)
+    df_hqi['recording_id'] = df_hqi['recording_id'].astype(str)
+    
+    # Step 1: Inner join so only HQI-computed recordings are processed
+    df_merged = df_meta.merge(df_hqi, left_on='id', right_on='recording_id', how='inner')
+    print(f"Processing {len(df_merged)} recordings with valid HQI scores.")
+    
+    raw_audio_dir = os.path.join(PROJECT_ROOT, DATA_RAW, "audio")
+    clean_audio_dir = os.path.join(PROJECT_ROOT, DATA_CLEAN)
+    os.makedirs(raw_audio_dir, exist_ok=True)
+    os.makedirs(clean_audio_dir, exist_ok=True)
+    
+    attrition_log = []
+    
+    # Initialize pyloudnorm meter
+    meter = pyln.Meter(TARGET_SR)
+    
+    # Step 2: Processing loop
+    for i, row in tqdm(df_merged.iterrows(), total=len(df_merged), desc="Preprocessing"):
+        rec_id = str(row['id'])
+        url = row['file_url']
+            
+        mp3_path = os.path.join(raw_audio_dir, f"{rec_id}.mp3")
+        wav_path = os.path.join(clean_audio_dir, f"{rec_id}.wav")
+        
+        status = 'accepted'
+        snr_db = np.nan
+        
+        # a) Download audio file
+        if not pd.isna(url) and not download_audio(url, mp3_path):
+            status = 'download_failed'
+            attrition_log.append({
+                'recording_id': rec_id,
+                'status': status,
+                'snr_db': snr_db,
+                'quality_tier': row['quality'],
+                'hqi': row['hqi']
+            })
+            continue
+            
+        try:
+            # b) Load, resample to 48000 Hz, convert to mono
+            y, sr = librosa.load(mp3_path, sr=TARGET_SR, mono=True)
+            
+            # Remove empty tracks
+            if len(y) == 0:
+                raise ValueError("Empty audio file")
+            
+            # e) Detect clipping before applying gains or filters
+            if detect_clipping(y):
+                status = 'rejected_clipping'
+            else:
+                # d) Estimate SNR
+                snr_db = estimate_snr(y, sr)
+                
+                if snr_db < MIN_SNR_DB:
+                    status = 'rejected_snr'
+                else:
+                    # c) Apply gentle bandpass filter
+                    y_filtered = butter_bandpass_filter(y, BANDPASS_LOW_HZ, BANDPASS_HIGH_HZ, sr, order=4)
+                    
+                    # f) Loudness normalisation to -23 LUFS
+                    loudness = meter.integrated_loudness(y_filtered)
+                    # Handle completely silent (or extremely quiet) files
+                    if np.isinf(loudness):
+                        raise ValueError("Infinite loudness detected (silent file).")
+                        
+                    y_norm = pyln.normalize.loudness(y_filtered, loudness, -23.0)
+                    
+                    # Soft clip to ensure no overflow after normalisation
+                    y_norm = np.clip(y_norm, -1.0, 1.0)
+                    
+                    # g) Export to clean/ as 16-bit PCM WAV
+                    sf.write(wav_path, y_norm, TARGET_SR, subtype='PCM_16')
+                    status = 'accepted'
+                    
+        except Exception as e:
+            # Handle corrupted or unsupported audio files
+            status = 'download_failed'
+            
+        # Step 3: Track rejections
+        attrition_log.append({
+            'recording_id': rec_id,
+            'status': status,
+            'snr_db': snr_db,
+            'quality_tier': row['quality'],
+            'hqi': row['hqi']
+        })
+
+    # Save attrition log
+    df_log = pd.DataFrame(attrition_log)
+    log_path = os.path.join(PROJECT_ROOT, DATA_RAW, "audio_attrition_log.csv")
+    df_log.to_csv(log_path, index=False)
+    print(f"\n[✓] Attrition log saved to {log_path}")
+    
+    # Step 4: Print summary table
+    print("\n── Audio Preprocessing Summary ──")
+    status_counts = df_log['status'].value_counts()
+    for st, count in status_counts.items():
+        print(f"  {st:<20}: {count:>4}")
+        
+    print("\n── Rejection Rates by Quality Tier ──")
+    tiers = df_log['quality_tier'].dropna().unique()
+    for t in sorted(tiers):
+        df_t = df_log[df_log['quality_tier'] == t]
+        total_t = len(df_t)
+        if total_t == 0:
+            continue
+        rejected_t = len(df_t[df_t['status'] != 'accepted'])
+        rate = 100 * rejected_t / total_t
+        print(f"  Tier {t}: {rate:5.1f}% ({rejected_t}/{total_t})")
+
+if __name__ == "__main__":
+    main()
