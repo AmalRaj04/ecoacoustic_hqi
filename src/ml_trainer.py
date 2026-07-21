@@ -173,7 +173,7 @@ def main():
     plt.xlabel('Actual HQI')
     plt.ylabel('Predicted HQI')
     plt.grid(alpha=0.3)
-    plt.savefig(out_dir / "actual_vs_predicted_hqi.png", dpi=150, bbox_inches='tight')
+    plt.savefig(out_dir / "actual_vs_predicted_hqi.png", dpi=300, bbox_inches='tight')
     plt.close()
     
     # RMSE per spatial block
@@ -193,7 +193,7 @@ def main():
     plt.ylabel('RMSE')
     plt.xticks(rotation=90)
     plt.grid(axis='y', alpha=0.3)
-    plt.savefig(out_dir / "rmse_per_spatial_block.png", dpi=150, bbox_inches='tight')
+    plt.savefig(out_dir / "rmse_per_spatial_block.png", dpi=300, bbox_inches='tight')
     plt.close()
     
     print(f"\n[✓] Saved best model to {best_model_path.name}")
